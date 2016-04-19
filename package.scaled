@@ -1,0 +1,10 @@
+   name: gradle-project
+ source: git:https://github.com/scaled/gradle-project.git
+version: 1.0
+descrip: Provides Scaled project support for Gradle projects.
+ weburl: https://github.com/scaled/gradle-project
+license: New BSD
+ depend: git:https://github.com/scaled/project-service.git
+ depend: mvn:org.gradle:gradle-tooling-api:2.9
+ depend: git:https://github.com/scaled/java-project.git
+ depend: git:https://github.com/scaled/scala-project.git

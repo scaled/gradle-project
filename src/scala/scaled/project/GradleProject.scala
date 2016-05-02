@@ -12,7 +12,7 @@ import org.gradle.tooling._
 import org.gradle.tooling.model._
 import org.gradle.tooling.model.{GradleProject => GP}
 
-class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractFileProject(ps) {
+class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProject(ps, r) {
   import Project._
 
   private[this] val _conn = new Close.Ref[ProjectConnection](toClose) {
@@ -28,9 +28,6 @@ class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractF
 
   private case class Info (rootProj :GP, proj :GP) {
     def name = proj.getName
-    lazy val idName = {
-      "TODO"
-    }
     lazy val ids = try {
       Seq(gradleId, mvnId)
     } catch {
@@ -44,8 +41,8 @@ class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractF
     }
   }
 
-  private[this] val _info = new Close.Ref[Info](toClose) {
-    protected def create = {
+  override def init () {
+    metaSvc.exec.runAsync(pspace.wspace) {
       val rootProj = _conn.get.getModel(classOf[GP])
       // Gradle returns the root project even if we ask for a connector in a subproject, so find
       // our way back down to the subproject that represents us
@@ -59,7 +56,34 @@ class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractF
         } else proj
       }
       Info(rootProj, findProject(rootProj))
-    }
+    } onSuccess { finishInit }
+  }
+
+  private def finishInit (info :Info) {
+    // add our JavaComponent
+    val java = new JavaComponent(this)
+    addComponent(classOf[JavaComponent], java)
+    val classesDir = info.buildDir
+    val classpath = Seq(classesDir) // TODO
+    java.javaMetaV() = java.javaMetaV().copy(
+      classes = Seq(classesDir),
+      outputDir = classesDir,
+      buildClasspath = classpath,
+      execClasspath = classpath
+    )
+    java.addTesters()
+
+    // add dirs to our ignores
+    val igns = FileProject.stockIgnores
+    igns += FileProject.ignorePath(info.buildDir)
+    ignores() = igns
+
+    metaV() = metaV().copy(
+      name = info.name,
+      ids = info.ids
+      // sourceDirs = if (isMain) allLangs(buildDir("sourceDirectory", "src/main/java"))
+      //              else allLangs(buildDir("testSourceDirectory", "src/test/java"))
+    )
   }
 
   // // hibernate if build.gradle changes, which will trigger reload
@@ -68,10 +92,6 @@ class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractF
   // }
   // // note that we don't 'close' our watches, we'll keep them active for the lifetime of the editor
   // // because it's low overhead; I may change my mind on this front later, hence this note
-
-  override def name = _info.get.name
-  override def idName = _info.get.idName
-  override def ids = _info.get.ids
 
   // override def testSeed =
   //   if (mod.name == "test") None
@@ -86,9 +106,6 @@ class GradleProject (val root :Project.Root, ps :ProjectSpace) extends AbstractF
   // }
 
   // def resourceDir :Path = rootPath.resolve("src/resources")
-
-  override protected def ignores = FileProject.stockIgnores ++
-    Seq(FileProject.ignorePath(_info.get.buildDir))
 
   // override protected def createCompiler () = {
   //   val ssum = summarizeSources

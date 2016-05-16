@@ -15,7 +15,7 @@ import org.gradle.tooling.model.{GradleProject => GP}
 class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProject(ps, r) {
   import Project._
 
-  private[this] val _conn = new Close.Ref[ProjectConnection](toClose) {
+  private[this] val conn = new Close.Ref[ProjectConnection](toClose) {
     protected def create = {
       val conn = GradleConnector.newConnector()
       conn.forProjectDirectory(root.path.toFile)
@@ -25,6 +25,9 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
       ref.close()
     }
   }
+
+  private val java = new JavaComponent(this)
+  addComponent(classOf[JavaComponent], java)
 
   private case class Info (rootProj :GP, proj :GP) {
     def name = proj.getName
@@ -36,14 +39,14 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
     def buildDir = proj.getBuildDirectory.toPath
     private def gradleId = SrcURL("gradle", s"//${rootProj.getName}${proj.getPath}")
     private def mvnId = {
-      val mod = _conn.get.getModel(classOf[GradleModuleVersion])
+      val mod = conn.get.getModel(classOf[GradleModuleVersion])
       RepoId("mvn", mod.getGroup, mod.getName, mod.getVersion)
     }
   }
 
   override def init () {
     metaSvc.exec.runAsync(pspace.wspace) {
-      val rootProj = _conn.get.getModel(classOf[GP])
+      val rootProj = conn.get.getModel(classOf[GP])
       // Gradle returns the root project even if we ask for a connector in a subproject, so find
       // our way back down to the subproject that represents us
       def findProject (proj :GP) :GP = {
@@ -60,9 +63,7 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   }
 
   private def finishInit (info :Info) {
-    // add our JavaComponent
-    val java = new JavaComponent(this)
-    addComponent(classOf[JavaComponent], java)
+    // init our JavaComponent
     val classesDir = info.buildDir
     val classpath = Seq(classesDir) // TODO
     java.javaMetaV() = java.javaMetaV().copy(

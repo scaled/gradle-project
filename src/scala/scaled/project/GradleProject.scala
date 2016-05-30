@@ -4,13 +4,19 @@
 
 package scaled.project
 
+import codex.model.Def
 import java.io.OutputStream
 import java.nio.file.{Files, Path, Paths}
+import java.util.{Date, EnumSet}
 import scaled._
 import scaled.util.{BufferBuilder, Close}
 
 import org.gradle.tooling._
+import org.gradle.tooling.Failure
 import org.gradle.tooling.model._
+import org.gradle.tooling.events._
+import org.gradle.tooling.events.{ProgressListener, ProgressEvent}
+import org.gradle.tooling.events.test._
 import org.gradle.tooling.model.idea._
 import org.gradle.tooling.model.{GradleProject => GP}
 
@@ -43,6 +49,8 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   private val java = new JavaComponent(this)
   addComponent(classOf[JavaComponent], java)
 
+  private val testSourceDirs = SeqBuffer[Path]()
+
   private case class Info (rootProj :GP, proj :GP, idea :IdeaProject) {
     def name = proj.getName
     lazy val ids = try {
@@ -59,8 +67,9 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   }
 
   override def init () {
-    // add our compiler component
+    // add our compiler & tester components
     addComponent(classOf[Compiler], new GradleCompiler)
+    addComponent(classOf[Tester], new GradleTester)
 
     // initialize gradle in a background thread because it's slow and grindy
     pspace.wspace.exec.runAsync {
@@ -99,10 +108,12 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
 
     // TEMP: aggregate all modules into one giant blob of project metadata
     var srcDirs = Seq.builder[Path]()
+    testSourceDirs.clear()
     var buildDirs = Seq.builder[Path]()
     info.idea.getModules foreach { module =>
       module.getContentRoots foreach { croot =>
         croot.getSourceDirectories foreach { sdir => srcDirs += sdir.getDirectory.toPath }
+        croot.getTestDirectories foreach { sdir => testSourceDirs += sdir.getDirectory.toPath }
         croot.getExcludeDirectories foreach { dir =>
           igns += FileProject.ignorePath(dir.toPath, root.path) }
       }
@@ -119,42 +130,42 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
     )
   }
 
+  private class BufferOutputStream (buffer :Buffer) extends OutputStream {
+    private val accum = new Array[Byte](4096)
+    private var pos = 0
+
+    override def write (b :Int) {
+      accum(pos) = b.toByte
+      pos += 1
+    }
+    override def write (bytes :Array[Byte], off :Int, len :Int) {
+      if (pos + len > accum.length) {
+        println("Zoiks! Overflow!")
+      } else {
+        System.arraycopy(bytes, off, accum, pos, len)
+        pos += len
+      }
+    }
+    override def flush () {
+      var text = new String(accum, 0, pos, "UTF-8")
+      pos = 0
+      metaSvc.exec.runOnUI { buffer.append(Line.fromText(text)) }
+    }
+    override def close () {}
+  }
+
   private class GradleCompiler extends Compiler(this) {
     import Compiler._
 
     override def describeEngine = "gradle"
 
     protected def compile (buffer :Buffer, file :Option[Path]) :Future[Boolean] = {
-      class BufferOutputStream extends OutputStream {
-        private val accum = new Array[Byte](4096)
-        private var pos = 0
-
-        override def write (b :Int) {
-          accum(pos) = b.toByte
-          pos += 1
-        }
-        override def write (bytes :Array[Byte], off :Int, len :Int) {
-          if (pos + len > accum.length) {
-            println("Zoiks! Overflow!")
-          } else {
-            System.arraycopy(bytes, off, accum, pos, len)
-            pos += len
-          }
-        }
-        override def flush () {
-          var text = new String(accum, 0, pos, "UTF-8")
-          pos = 0
-          metaSvc.exec.runOnUI { buffer.append(Line.fromText(text)) }
-        }
-        override def close () {}
-      }
-
       var result = Promise[Boolean]()
       val tasks = if (file.isDefined) Array("classes") else Array("clean", "classes")
       conn.get.newBuild.
         forTasks(tasks :_*).
-        setStandardOutput(new BufferOutputStream()).
-        setStandardError(new BufferOutputStream()).
+        setStandardOutput(new BufferOutputStream(buffer)).
+        setStandardError(new BufferOutputStream(buffer)).
         run(new ResultHandler[Void] {
           override def onComplete (unused :Void) = result.succeed(true)
           // TODO: the exception that indicates compilation failure is nested four levels deep, but
@@ -186,6 +197,63 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
           case e :Exception => log.log("Error parsing error buffer", e) ; Compiler.NoMoreNotes
         }
       }
+    }
+  }
+
+  private class GradleTester extends JavaTester(this) {
+    override def testSourceDirs = GradleProject.this.testSourceDirs
+    override def describeSelf (bb :BufferBuilder) {
+      bb.addSection("Test Sources:")
+      testSourceDirs foreach { p => bb.add(p.toString) }
+    }
+
+    override def runAllTests (window :Window, interact :Boolean) = {
+      val buf = logBuffer
+      buf.replace(buf.start, buf.end, Line.fromTextNL(s"Tests started at ${new Date}..."))
+      var result = Promise[Boolean]()
+      var status = new Array[Int](3)
+      var fails = SeqBuffer[Failure]()
+
+      def finish () :Unit = window.exec.runOnUI {
+        noteResults(window, interact, status(0), toVisits(fails))
+      }
+
+      conn.get.newBuild.
+        forTasks("test").
+        setStandardOutput(new BufferOutputStream(buf)).
+        setStandardError(new BufferOutputStream(buf)).
+        addProgressListener(new ProgressListener {
+          override def statusChanged (event :ProgressEvent) = event match {
+            case finish :TestFinishEvent => finish.getResult match {
+              case success :TestSuccessResult => status(0) += 1
+              case skipped :TestSkippedResult => status(1) += 1
+              case failure :TestFailureResult =>
+                status(2) += 1
+                finish.getDescriptor match {
+                  case jvm :JvmTestOperationDescriptor =>
+                    failure.getFailures foreach { fail =>
+                      extractFailure(fail.getDescription, jvm.getClassName,
+                                     jvm.getMethodName, fails)
+                    }
+                  case _ => // alas
+                }
+            }
+            case _ => // TODO: ignore?
+          }
+        }, EnumSet.of(OperationType.TEST)).
+        run(new ResultHandler[Void] {
+          override def onComplete (unused :Void) = finish()
+          override def onFailure (cause :GradleConnectionException) = finish()
+        })
+      true
+    }
+
+    override def runTests (window :Window, interact :Boolean, file :Path, types :SeqV[Def]) = {
+      true
+    }
+
+    override def runTest (window :Window, file :Path, elem :Def) = {
+      Future.failure(new Exception("TODO"))
     }
   }
 

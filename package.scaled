@@ -5,6 +5,6 @@ descrip: Provides Scaled project support for Gradle projects.
  weburl: https://github.com/scaled/gradle-project
 license: New BSD
  depend: git:https://github.com/scaled/project-service.git
- depend: mvn:org.gradle:gradle-tooling-api:2.9
+ depend: mvn:org.gradle:gradle-tooling-api:2.14-rc-2
  depend: git:https://github.com/scaled/java-project.git
  depend: git:https://github.com/scaled/scala-project.git

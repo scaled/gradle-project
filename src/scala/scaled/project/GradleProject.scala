@@ -4,16 +4,30 @@
 
 package scaled.project
 
-import java.nio.file.{Files, Path}
+import java.io.OutputStream
+import java.nio.file.{Files, Path, Paths}
 import scaled._
 import scaled.util.{BufferBuilder, Close}
 
 import org.gradle.tooling._
 import org.gradle.tooling.model._
+import org.gradle.tooling.model.idea._
 import org.gradle.tooling.model.{GradleProject => GP}
+
+object GradleProject {
+
+  // matches: "(w|e): /foo/bar/baz.kt: (LL, CC): some error message"
+  val noteM = Matcher.regexp("""^(.): ([^:]+): \((\d+), (\d+)\): (.*)""")
+
+  @Plugin(tag="project-finder")
+  class FinderPlugin extends ProjectFinderPlugin("gradle", true, classOf[GradleProject]) {
+    def checkRoot (root :Path) :Int = if (exists(root, "build.gradle")) 1 else -1
+  }
+}
 
 class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProject(ps, r) {
   import Project._
+  import GradleProject._
 
   private[this] val conn = new Close.Ref[ProjectConnection](toClose) {
     protected def create = {
@@ -29,7 +43,7 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   private val java = new JavaComponent(this)
   addComponent(classOf[JavaComponent], java)
 
-  private case class Info (rootProj :GP, proj :GP) {
+  private case class Info (rootProj :GP, proj :GP, idea :IdeaProject) {
     def name = proj.getName
     lazy val ids = try {
       Seq(gradleId, mvnId)
@@ -45,12 +59,17 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   }
 
   override def init () {
-    metaSvc.exec.runAsync(pspace.wspace) {
+    // add our compiler component
+    addComponent(classOf[Compiler], new GradleCompiler)
+
+    // initialize gradle in a background thread because it's slow and grindy
+    pspace.wspace.exec.runAsync {
       val rootProj = conn.get.getModel(classOf[GP])
       // Gradle returns the root project even if we ask for a connector in a subproject, so find
       // our way back down to the subproject that represents us
       def findProject (proj :GP) :GP = {
         val proot = proj.getProjectDirectory.toPath
+        println("Checking " + proot + " / " + root.path)
         if (root.path == proot) proj
         else if (root.path.startsWith(proot)) {
           val name = proot.relativize(root.path).getName(0).toString
@@ -58,7 +77,7 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
           proj
         } else proj
       }
-      Info(rootProj, findProject(rootProj))
+      Info(rootProj, findProject(rootProj), conn.get.getModel(classOf[IdeaProject]))
     } onSuccess { finishInit }
   }
 
@@ -76,23 +95,99 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
 
     // add dirs to our ignores
     val igns = FileProject.stockIgnores
-    igns += FileProject.ignorePath(info.buildDir)
+    igns += FileProject.ignorePath(info.buildDir, root.path)
+
+    // TEMP: aggregate all modules into one giant blob of project metadata
+    var srcDirs = Seq.builder[Path]()
+    var buildDirs = Seq.builder[Path]()
+    info.idea.getModules foreach { module =>
+      module.getContentRoots foreach { croot =>
+        croot.getSourceDirectories foreach { sdir => srcDirs += sdir.getDirectory.toPath }
+        croot.getExcludeDirectories foreach { dir =>
+          igns += FileProject.ignorePath(dir.toPath, root.path) }
+      }
+      var buildDir = module.getCompilerOutput.getOutputDir
+      if (buildDir != null) buildDirs += buildDir.toPath
+    }
+
     ignores() = igns
 
     metaV() = metaV().copy(
       name = info.name,
-      ids = info.ids
-      // sourceDirs = if (isMain) allLangs(buildDir("sourceDirectory", "src/main/java"))
-      //              else allLangs(buildDir("testSourceDirectory", "src/test/java"))
+      ids = info.ids,
+      sourceDirs = srcDirs.build()
     )
   }
 
-  // // hibernate if build.gradle changes, which will trigger reload
-  // { val watchSvc = metaSvc.service[WatchService]
-  //   watchSvc.watchFile(buildFile, file => hibernate())
-  // }
-  // // note that we don't 'close' our watches, we'll keep them active for the lifetime of the editor
-  // // because it's low overhead; I may change my mind on this front later, hence this note
+  private class GradleCompiler extends Compiler(this) {
+    import Compiler._
+
+    override def describeEngine = "gradle"
+
+    protected def compile (buffer :Buffer, file :Option[Path]) :Future[Boolean] = {
+      class BufferOutputStream extends OutputStream {
+        private val accum = new Array[Byte](4096)
+        private var pos = 0
+
+        override def write (b :Int) {
+          accum(pos) = b.toByte
+          pos += 1
+        }
+        override def write (bytes :Array[Byte], off :Int, len :Int) {
+          if (pos + len > accum.length) {
+            println("Zoiks! Overflow!")
+          } else {
+            System.arraycopy(bytes, off, accum, pos, len)
+            pos += len
+          }
+        }
+        override def flush () {
+          var text = new String(accum, 0, pos, "UTF-8")
+          pos = 0
+          metaSvc.exec.runOnUI { buffer.append(Line.fromText(text)) }
+        }
+        override def close () {}
+      }
+
+      var result = Promise[Boolean]()
+      val tasks = if (file.isDefined) Array("classes") else Array("clean", "classes")
+      conn.get.newBuild.
+        forTasks(tasks :_*).
+        setStandardOutput(new BufferOutputStream()).
+        setStandardError(new BufferOutputStream()).
+        run(new ResultHandler[Void] {
+          override def onComplete (unused :Void) = result.succeed(true)
+          // TODO: the exception that indicates compilation failure is nested four levels deep, but
+          // it would be nice to differentiate that from some other weird failure...
+          override def onFailure (cause :GradleConnectionException) = result.succeed(false)
+        })
+      return result
+    }
+
+    protected def nextNote (buffer :Buffer, start :Loc) :(Note,Loc) = {
+      buffer.findForward(noteM, start) match {
+        case Loc.None => NoMoreNotes
+        case ploc => try {
+          val ekind = noteM.group(1)
+          val file = Paths.get(noteM.group(2))
+          val eline = noteM.group(3).toInt-1
+          val ecol = noteM.group(4).toInt-1
+          val errPre = noteM.group(5).trim
+          // every line after the path with leading whitespace is part of the message
+          val desc = Seq.builder[String]()
+          desc += errPre
+          var pnext = ploc.nextStart
+          // while (pnext < buffer.end && buffer.line(pnext).indexOf(Chars.isWhitespace) == 0) {
+          //   desc += buffer.line(pnext).asString
+          //   pnext = pnext.nextStart
+          // }
+          (Compiler.Note(Store(file), Loc(eline, ecol), desc.build(), ekind == "e"), pnext)
+        } catch {
+          case e :Exception => log.log("Error parsing error buffer", e) ; Compiler.NoMoreNotes
+        }
+      }
+    }
+  }
 
   // override def testSeed =
   //   if (mod.name == "test") None
@@ -108,42 +203,6 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
 
   // def resourceDir :Path = rootPath.resolve("src/resources")
 
-  // override protected def createCompiler () = {
-  //   val ssum = summarizeSources
-
-  //   // TODO: do we want to try to support multi-lingual projects? that sounds like a giant PITA,
-  //   // but we could probably at least generate a warning if we have some crazy mishmash of sources
-
-  //   // TEMP: if we have any Kotlin files, we just use the KotlinCompiler
-  //   if (ssum.contains("kt")) new KotlinCompiler(this) {
-  //     // TODO: this is a lot of annoying duplication...
-  //     override def sourceDirs = ScaledProject.this.sourceDirs
-  //     override def buildClasspath = ScaledProject.this.buildClasspath
-  //     override def outputDir = ScaledProject.this.outputDir
-
-  //     override def javacOpts = pkg.jcopts.toSeq
-  //     override def kotlincOpts = ScaledProject.this.kotlincOpts
-  //     // override def kotlincVers = ScaledProject.this.kotlincVers
-
-  //     override protected def willCompile () {
-  //       if (Files.exists(resourceDir)) Filez.copyAll(resourceDir, outputDir)
-  //     }
-
-  //   } else new ScalaCompiler(this) {
-  //     override def sourceDirs = ScaledProject.this.sourceDirs
-  //     override def buildClasspath = ScaledProject.this.buildClasspath
-  //     override def outputDir = ScaledProject.this.outputDir
-
-  //     override def javacOpts = pkg.jcopts.toSeq
-  //     override def scalacOpts = ScaledProject.this.scalacOpts
-  //     override def scalacVers = ScaledProject.this.scalacVers
-
-  //     override protected def willCompile () {
-  //       if (Files.exists(resourceDir)) Filez.copyAll(resourceDir, outputDir)
-  //     }
-  //   }
-  // }
-
   // // scaled projects don't have a magical test subproject; tests are in a top-level project
   // // (usually a module named tests or test)
   // override protected def createTester () :Tester = new JUnitTester(this) {
@@ -151,12 +210,4 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   //   override def testOutputDir = outputDir
   //   override def testClasspath = buildClasspath
   // }
-}
-
-object GradleProject {
-
-  @Plugin(tag="project-finder")
-  class FinderPlugin extends ProjectFinderPlugin("gradle", true, classOf[GradleProject]) {
-    def checkRoot (root :Path) :Int = if (exists(root, "build.gradle")) 1 else -1
-  }
 }

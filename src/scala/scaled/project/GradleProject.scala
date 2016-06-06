@@ -49,68 +49,74 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
   private val java = new JavaComponent(this)
   addComponent(classOf[JavaComponent], java)
 
+  private val sourceDirsToModule = SeqBuffer[(Path,String)]
   private val testSourceDirs = SeqBuffer[Path]()
 
-  private case class Info (rootProj :GP, proj :GP, idea :IdeaProject) {
-    def name = proj.getName
-    lazy val ids = try {
-      Seq(gradleId, mvnId)
-    } catch {
-      case ume :UnknownModelException => Seq(gradleId)
+  private def moduleForPath (bpath :Path) :Option[String] = {
+    for ((path, module) <- sourceDirsToModule) {
+      if (bpath.startsWith(path)) return Some(module)
     }
-    def buildDir = proj.getBuildDirectory.toPath
-    private def gradleId = SrcURL("gradle", s"//${rootProj.getName}${proj.getPath}")
-    private def mvnId = {
-      val mod = conn.get.getModel(classOf[GradleModuleVersion])
-      RepoId("mvn", mod.getGroup, mod.getName, mod.getVersion)
-    }
+    None
   }
 
-  override def init () {
+  override def addToBuffer (buffer :RBuffer) {
+    // if this is the root project, check whether we need to reroute to the appropriate module
+    // project
+    if (r.module.length == 0 && buffer.store.file.isDefined) {
+      val modOpt = moduleForPath(buffer.store.file.get)
+      if (modOpt.isDefined) {
+        val mroot = Project.Root(root.path, modOpt.get)
+        val seed = Project.Seed(mroot, "gradle", true, classOf[GradleProject], mroot :: Nil)
+        val proj = pspace.projectFromSeed(seed)
+        proj.ready.onSuccess { proj => proj.addToBuffer(buffer) }
+        return
+      }
+    }
+    super.addToBuffer(buffer)
+  }
+
+  private case class Info (rootProj :GP, idea :IdeaProject)
+
+  override protected def computeMeta (oldMeta :Project.Meta) = {
     // add our compiler & tester components
     addComponent(classOf[Compiler], new GradleCompiler)
     addComponent(classOf[Tester], new GradleTester)
 
     // initialize gradle in a background thread because it's slow and grindy
     pspace.wspace.exec.runAsync {
-      val rootProj = conn.get.getModel(classOf[GP])
-      // Gradle returns the root project even if we ask for a connector in a subproject, so find
-      // our way back down to the subproject that represents us
-      def findProject (proj :GP) :GP = {
-        val proot = proj.getProjectDirectory.toPath
-        println("Checking " + proot + " / " + root.path)
-        if (root.path == proot) proj
-        else if (root.path.startsWith(proot)) {
-          val name = proot.relativize(root.path).getName(0).toString
-          for (child <- proj.getChildren) if (child.getName == name) return findProject(child)
-          proj
-        } else proj
-      }
-      Info(rootProj, findProject(rootProj), conn.get.getModel(classOf[IdeaProject]))
-    } onSuccess { finishInit }
+      Info(conn.get.getModel(classOf[GP]), conn.get.getModel(classOf[IdeaProject]))
+    } map { finishInit(oldMeta, _) }
   }
 
-  private def finishInit (info :Info) {
-    // init our JavaComponent
-    val classesDir = info.buildDir
-    val classpath = Seq(classesDir) // TODO
-    java.javaMetaV() = java.javaMetaV().copy(
-      classes = Seq(classesDir),
-      outputDir = classesDir,
-      buildClasspath = classpath,
-      execClasspath = classpath
-    )
-    java.addTesters()
-
+  private def finishInit (oldMeta :Project.Meta, info :Info) = {
     // add dirs to our ignores
     val igns = FileProject.stockIgnores
-    igns += FileProject.ignorePath(info.buildDir, root.path)
+    // igns += FileProject.ignorePath(info.buildDir, root.path)
 
     // TEMP: aggregate all modules into one giant blob of project metadata
     var srcDirs = Seq.builder[Path]()
     testSourceDirs.clear()
     var buildDirs = Seq.builder[Path]()
+
+    // go through and map all source directories to their owning module
     info.idea.getModules foreach { module =>
+      module.getContentRoots foreach { croot =>
+        croot.getSourceDirectories foreach { sdir =>
+          sourceDirsToModule += (sdir.getDirectory.toPath -> module.getName) }
+        croot.getTestDirectories foreach { sdir =>
+          sourceDirsToModule += (sdir.getDirectory.toPath -> module.getName) } // TODO: test tag
+      }
+    }
+
+    var pname = info.rootProj.getName
+    if (root.module.length > 0) pname = s"$pname:${root.module}"
+
+    // if we don't have a module, then find the module whose root matches our root
+    val modopt = if (root.module.length == 0) info.idea.getModules find {
+      _.getContentRoots exists { _.getRootDirectory.toPath == root.path }}
+    // otherwise find the module that matches our name
+    else info.idea.getModules find { _.getName == root.module }
+    modopt.foreach { module =>
       module.getContentRoots foreach { croot =>
         croot.getSourceDirectories foreach { sdir => srcDirs += sdir.getDirectory.toPath }
         croot.getTestDirectories foreach { sdir => testSourceDirs += sdir.getDirectory.toPath }
@@ -123,9 +129,32 @@ class GradleProject (ps :ProjectSpace, r :Project.Root) extends AbstractFileProj
 
     ignores() = igns
 
-    metaV() = metaV().copy(
-      name = info.name,
-      ids = info.ids,
+    if (!buildDirs.isEmpty) {
+      // init our JavaComponent
+      val classesDir = buildDirs.head
+      val classpath = buildDirs // TODO: depends!
+      java.javaMetaV() = java.javaMetaV().copy(
+        classes = buildDirs,
+        outputDir = classesDir,
+        buildClasspath = classpath,
+        execClasspath = classpath
+      )
+      java.addTesters()
+    }
+
+    def gradleId = SrcURL("gradle", s"//$pname")
+    def mvnId = {
+      val mod = conn.get.getModel(classOf[GradleModuleVersion])
+      RepoId("mvn", mod.getGroup, mod.getName, mod.getVersion)
+    }
+
+    oldMeta.copy(
+      name = pname, // TODO
+      ids = try {
+        Seq(gradleId, mvnId)
+      } catch {
+        case ume :UnknownModelException => Seq(gradleId)
+      },
       sourceDirs = srcDirs.build()
     )
   }

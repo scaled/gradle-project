@@ -6,5 +6,5 @@ descrip: Provides Scaled project support for Gradle projects.
 license: New BSD
  depend: git:https://github.com/scaled/project-service.git
  depend: mvn:org.gradle:gradle-tooling-api:3.5
- depend: git:https://github.com/scaled/java-project.git
- depend: git:https://github.com/scaled/scala-project.git
+ depend: git:https://github.com/scaled/java-mode.git
+ depend: git:https://github.com/scaled/scala-mode.git
